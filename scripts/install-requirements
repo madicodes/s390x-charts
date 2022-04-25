@@ -1,0 +1,35 @@
+#!/bin/bash
+
+## verify kubectl  is installed on host
+[[ "$(command -v kubectl)" ]] || { 
+sudo curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl";
+sudo curl -LO "https://dl.k8s.io/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl.sha256";
+sudo echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check;
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl;
+}
+
+## verify helm  is installed on host
+[[ "$(command -v helm)" ]] || { 
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3;
+chmod 700 get_helm.sh;
+./get_helm.sh;
+}
+
+## verify netcat  is installed on host
+[[ "$(command -v nc)" ]] || { 
+zypper install -y  netcat-openbsd;
+}
+
+## verify reg  is installed on host
+[[ "$(command -v reg)" ]] || { 
+zypper --non-interactive addrepo https://download.opensuse.org/repositories/devel:/tools/SLE_15_SP2/devel:tools.repo;
+zypper install -y git-core;
+zypper --non-interactive addrepo https://download.opensuse.org/repositories/devel:/languages:/go/SLE_15_SP3/devel:languages:go.repo;
+zypper refresh;
+zypper install -y go1.15;
+git clone https://github.com/genuinetools/reg.git;
+cd reg/;
+go get github.com/genuinetools/reg;
+go build;
+cp reg /usr/local/bin/reg;
+}

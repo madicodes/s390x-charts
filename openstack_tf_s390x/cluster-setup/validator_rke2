@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+set -aeEuo pipefail
+
+# TODOs
+# mkdir -p ${WORKDIR:=$BASEDIR/cluster-$(date '+%s')}
+
+# If some magic fails
+# - problem with aliases in ENV setup?
+# - broken pipe with grep -qm, tail?
+
+usage() {
+    echo "Usage: $0 [ -p <platform> | -j <json_file|cluster_dir> ] [ -t <test> -g <url> -n m:w -k -K ] [ -i -r -R ]
+        -p Platform to be tested: openstack | vmware | kvm | bare-metal
+        -j Path to cluster.json file or cluster_XXX directory
+           This option will skip deployment and use existing cluster
+        -t Testsuite to execute:
+           none: only deployment
+           join: build skuba cluster (autodetected, default)
+           base: run base cluster tests
+           full: run also time-consuming cluster tests
+           <test>: run selected test from TESTDIR
+        -n Use master:worker count for deployment
+        -g Build skuba from git url (PR/Branch)
+           -g up(stream) to git pull --rebase
+           -g https://github.com/SUSE/skuba/pull/685 (or pr#685)
+           -g https://github.com/ereslibre/skuba/tree/rename-etcd-member-remove-4.0
+        -k Keep cluster, don't run terraform destroy
+        -K Keep cluster only if something fails
+        -r Show results for tested clusters. Capital R will destroy all active deployments
+        -e Set extra variables -e name=[value] -e ...
+        -v RKE2 version (todo)
+
+        Requirements: It's up to you to setup env for terraform and ssh-agent with key
+         - openstack : source container-openrc.sh
+         - ssh-agent : ssh-add ./data/id_shared
+
+        Examples:
+        Deploy cluster with 5 workers on vmware with IBS repositories, bootstrap & join & sonobuoy tests, destroy deployment
+         - $0 -p vmware -t sono -n 1:5
+
+        Use existing cluster and run bootstrap & join & base tests on it
+         - $0 -j cluster_xyz -t cilium
+
+        Deploy on openstack, register with SCC, create cluster, keep deployment (release build)
+         - SCC=INTERNAL-USE-ONLY-XXXXX $0 -k
+
+        If NFS=1         if set cluster will deploy and configure NFS server on first master and will use it as default SC
+        If SUFFIX=<user> if set it will overwrite <whoami> default - it you need multiple clusters
+        If SCC=<key>     if set script will register with official SCC using <key>
+        Otherwise script will add IBS repos based on skuba version (development | staging | release)
+
+        To see what's happening: tail cluster_XXX/logs/background.log
+        Good Luck." 1>&2
+    exit 1
+}
+
+# ==================================================================================================
+# REQUIRED VARS & ENV setup
+[ -f env.conf ] && source env.conf
+[ -f env-openrc.conf ] && source env-openrc.conf # ci.suse.de
+
+: ${SUFFIX:=$(whoami)}
+: ${BASEDIR:=$PWD}
+: ${LIBDIR:=$BASEDIR/lib}
+: ${TESTDIR:=$BASEDIR/tests_s390x}
+: ${DATADIR:=$BASEDIR/data}
+: ${PARAMDIR:=$BASEDIR/parameters}
+: ${PLATFORM:=s390x}
+: ${TESTSUITE:=join}
+: ${MASTER_COUNT:=1}
+: ${WORKER_COUNT:=1}
+: ${RKE2_VERSION:=v1.23.5+rke2r1}
+
+shopt -s expand_aliases
+ssh_opts='-o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=error -o ConnectTimeout=30 -o User=root'
+alias ssh="ssh $ssh_opts"
+alias scp="scp $ssh_opts"
+alias curl="curl --silent --create-dirs"
+
+# ==================================================================================================
+# Logging & Functions & Traps
+exec 3>&1     # keep logs on stdout after redirection
+: ${OUTPUT:=} # don't print twice if output=stdout
+log  () { printf -- "$(date +%R) \e[${1}m${*:2}\e[0m\n" | tee -a ${OUTPUT/\/dev\/stdout} ${REPORT:-} >&3; }
+step () { log 32 "${*}" $(basename "${BASH_SOURCE[1]/${BASH_SOURCE}}" | sed 's/.\+/[&]/'); } # print test module
+info () { log 0  "  ${*}"; }
+warn () { log 33 "  ${*}"; }
+error() { log 31 "  ${*}"; }
+substep() { log 32 "  ${*}"; }
+
+tf_active () { jq -e '.modules[]?.resources // null + .resources | length > 0' "$1" &>/dev/null || return $?; }
+in_container() { grep -qE 'docker|crio|lxc' /proc/1/cgroup || return $?; }
+get_kubever() { kubectl version -o json | jq -r '.serverVersion.gitVersion' | sed 's/^v//'; }
+
+setup_container() {
+    eval "$(ssh-agent -s)"
+    chmod 600 ${DATADIR}/id_shared
+    ssh-add ${DATADIR}/id_shared
+    mkdir -p ~/.ssh
+    cp -n $DATADIR/container_ssh_config ~/.ssh/config
+    sed -i '/User/ s/sles/root/' ~/.ssh/config
+}
+
+list_clusters() {
+    ls -d cluster_??? > /dev/null # Check if cluster exists
+    # Birth time if available, otherwise modification time
+    [ $(stat -c %W .) -ne 0 ] && fmt='W' || fmt='Y'
+    for d in $(stat -c "%$fmt %n" cluster_??? | sort -rnk1 | cut -d' ' -f2); do
+        stdlog="$d/logs/report"
+        [ -f $stdlog ] || continue
+        platform=$(grep -Eosm1 '(Platform|Deploy):? (vmware|openstack|kvm|bare-metal|s390x)' $stdlog ||:)
+        size=$(sed -rn '/Masters|Workers/ s/.*: //p' $stdlog | awk 'NR <= 2 {print NF}' | paste -sd:)
+        suff=$(grep -m1 '###' $stdlog | awk '{print $(NF-1)}')
+
+        grep -sq "$d.*PASSED" $stdlog && result='✓' || result='?'
+        grep -sq "$d.*FAILED" $stdlog && result='x'
+        [ $(grep -soE "$d.*(PASSED|FAILED)" $stdlog | uniq | wc -l) -gt 1 ] && result='±'
+        tf_active "$d/terraform/terraform.tfstate" && result="\e[5m$result\e[0m"
+
+        printf "%(%F %R)T: $d [$result] ${platform#* } $size $suff" $(stat -c"%$fmt" $d)
+        if [ "${1:-}" = 'rm' ] && [[ "$result" =~ '\e[5m' ]]; then
+            printf ": destroying\n"
+            (cd $d/terraform && terraform destroy -auto-approve >/dev/null)
+        else
+            printf "\n"
+        fi
+    done
+    exit 0
+}
+
+
+
+trap_ctrlc() {
+    warn 'Interrupt received'
+    trap - INT
+    kill -s INT "$$"
+}
+
+# ==================================================================================================
+# Parse parameters
+
+trap 'error "Error on ${BASH_SOURCE/$BASEDIR/.}:${LINENO} $(sed -n "${LINENO} s/^\s*//p" $BASEDIR/${BASH_SOURCE/$BASEDIR})"' ERR
+
+if [ $# -eq 0 ]; then
+    ls -d cluster_??? &> /dev/null && list_clusters || { echo "No cluster found."; exit 0; }
+fi
+
+while getopts "j:p:g:n:t:rRkKe:v:" opt; do
+    case $opt in
+        p)  PLATFORM=$OPTARG
+            [[ $PLATFORM =~ ^(openstack|vmware|kvm|bare-metal|s390x)$ ]] || { echo "Bad platform: $PLATFORM"; exit 1; };;
+        t)  TESTSUITE=$OPTARG;;
+        j)  CLUSTER_JSON=$(realpath -e "$OPTARG")
+            if [ -d "$CLUSTER_JSON" ]; then
+                WORKDIR="$CLUSTER_JSON"
+                CLUSTER_JSON+="/logs/cluster.json"
+                SUFFIX=$(grep -m1 '###' "$WORKDIR/logs/report" | awk '{print $(NF-1)}')
+            fi
+            PLATFORM=json
+            PRESERVE=1;;
+        n)  [ -n "${OPTARG%:*}" ] && declare -i MASTER_COUNT=${OPTARG%:*}
+            [ -n "${OPTARG#*:}" ] && declare -i WORKER_COUNT=${OPTARG#*:};;
+        k)  PRESERVE=1;;
+        K)  PRESERVE_ON_FAILURE=1;;
+        r)  list_clusters;;
+        R)  list_clusters 'rm';;
+        e)  [ -n "${OPTARG#*=}" ] && declare "$OPTARG";;
+        v)  RKE2_VERSION=$OPTARG;;
+        \?) usage;;
+    esac
+done
+
+[ -v RKE2_VERSION ] && RKE2_VERSION=${RKE2_VERSION/#1/v1}
+[ $# -eq $((OPTIND-1)) ] || { echo "Bad param: ${@:$((OPTIND-2)):3}"; exit 1; } # Detect positional arguments
+
+source "$LIBDIR/helpers.sh"       # Functions used by tests
+source "$LIBDIR/helpers_rke2.sh"   # Helpers for rke2
+source "$LIBDIR/hacks.sh"         # Dirty hacks & workarounds
+
+: ${SSH_SHARED:=$(<$DATADIR/id_shared.pub)}
+NODE_COUNT=$((MASTER_COUNT+WORKER_COUNT))
+
+# RKE2 find last version (1.22 -> v1.22.8-rc5+rke2r1)
+if [[ ! $RKE2_VERSION =~ ^v1\.[0-9]+.*+rke2r ]]; then
+    echo -n "RKE2: $RKE2_VERSION -> "
+    RKE2_VERSION=$(get_latest_from $RKE2_VERSION)
+    echo "$RKE2_VERSION"
+fi
+RKE2_VERSION_ENC=$(jq -rn --arg x "$RKE2_VERSION" '$x|@uri')  # urlencode for "+"
+
+
+# ==================================================================================================
+# Check requirements & Create WORKDIR
+
+# if in_container; then
+#     # SSH setup container or find shared key (data/id_shared)
+#     setup_container &>/dev/null || ssh-add -l | grep id_shared > /dev/null
+#     CONTAINER_ID="$(sed -E 's#(.*[/-]|.scope)##' /proc/1/cpuset | cut -c -12)"
+# fi
+
+#[ "$SUFFIX" = "root" ] && { echo "Bad SUFFIX: $SUFFIX"; false; }
+which kubectl helm jq nc reg > /dev/null
+[[ $TESTSUITE =~ sono ]] && which sonobuoy > /dev/null
+[[ $TESTSUITE =~ import ]] && test -v IMPORTDIR
+
+[[ " $*" =~ ' -j' && " $*" =~ ' -'[np] ]] && { echo "Bad opts: -j overrides -n -p"; false; }
+[[ $TESTSUITE =~ none|join|base|full ]] || [ -f $TESTDIR/$TESTSUITE* 2>/dev/null ] || { echo "Bad test: $TESTSUITE"; false; }
+
+# RKE2 checks
+echo "$RKE_RELEASES_FULL" | grep -qF "$RKE2_VERSION" || { echo "Bad version: $RKE2_VERSION"; false; }
+curl -o /dev/null --head --fail https://raw.githubusercontent.com/rancher/rke2/$RKE2_VERSION_ENC/install.sh || { echo "RKE2: $RKE2_VERSION not found"; false; }
+
+# Check for env file
+mkdir -p ${WORKDIR:=$(mktemp -d -p "$BASEDIR" cluster_XXX)}
+mkdir -p ${LOGPATH:=$WORKDIR/logs}
+exec &>> ${OUTPUT:=$LOGPATH/console.log}
+REPORT="$LOGPATH/report"
+
+export HELM_HOME="$WORKDIR/helm"
+export KUBECONFIG="$WORKDIR/admin.conf"
+trap 'trap_exit' EXIT
+trap 'trap_ctrlc' INT
+
+# ==================================================================================================
+step "$(date '+%F') | ${WORKDIR##*/} | $* | $SUFFIX ###"
+source "$LIBDIR/environment.sh" >> "$LOGPATH/environment.log"
+
+
+# ==================================================================================================
+# Update container. Repo is added to nodes by terraform / autoyast
+
+cd "$WORKDIR"
+if [ -v CLUSTER_JSON ]; then
+    JSON=$(<$CLUSTER_JSON)
+    MASTER_COUNT=$(jq '.ip_masters.value | length' <<< "$JSON")
+    WORKER_COUNT=$(jq '.ip_workers.value | length' <<< "$JSON")
+    NODE_COUNT=$((MASTER_COUNT+WORKER_COUNT))
+    virt_ip=$(jq '.ip_masters.value | to_entries[0].value' -r <<< "$JSON")
+    virt=$(ssh $virt_ip systemd-detect-virt ||:)
+    virt=${virt/none/bare-metal}
+    # Distinguish between libvirt and openstack
+    if [ "$virt" = "kvm" ]; then
+        ssh $virt_ip sudo dmidecode | grep 'Product Name: OpenStack Nova' && virt=${virt/kvm/openstack}
+    fi
+    PLATFORM="$virt"
+    info "Platform: $PLATFORM"
+else
+    echo "Error accessing s390x VM..."
+fi
+echo "$JSON" > "$LOGPATH/cluster.json"
+
+step 'Parse IPs'
+#IP_LB=$(jq '.ip_load_balancer | .value[]? // .value // empty' -r <<< "$JSON")
+readarray -t IP_MASTERS < <(jq '.ip_masters.value[]' -r <<< "$JSON")
+readarray -t IP_WORKERS < <(jq '.ip_workers.value[]' -r <<< "$JSON")
+
+info "LB: ${IP_LB:-master[0]}"
+info "Masters: ${IP_MASTERS[*]}"
+info "Workers: ${IP_WORKERS[*]}"
+: ${IP_LB:=${IP_MASTERS[0]}}
+IP_NODES=("${IP_MASTERS[@]}" "${IP_WORKERS[@]}")
+
+# ==================================================================================================
+
+cd "$WORKDIR"
+if [[ ! $TESTSUITE =~ ^none|^00_entrypoint ]]; then
+    if curl $IP_LB:6443 > /dev/null; then
+        ssh -i ~/.ssh/id_shared ${IP_MASTERS[0]} 'sudo cat /etc/rancher/rke2/rke2.yaml' > "$WORKDIR/admin.conf"
+        sed -i "/server:/ s/127.0.0.1/${IP_MASTERS[0]}/" $WORKDIR/admin.conf
+    else
+        # Add fallback registry to prevent docker.io rate limiting
+        # add_fallback_reg
+        source "$TESTDIR/rke2_join.sh"
+    fi
+    # source "$TESTDIR/helm.sh"
+    # source "$TESTDIR/selenium.sh"
+fi
+
+if curl $IP_LB:6443 > /dev/null; then
+     RKE_CURRENT=$(ssh -i ~/.ssh/id_shared ${IP_MASTERS[0]} /usr/local/bin/rke2 -v | grep "^rke2" | cut -d' ' -f3)
+    #RKE_CURRENT=$(ssh -i ~/.ssh/id_shared ${IP_MASTERS[0]} /opt/rke2/bin/rke2 -v | grep "^rke2" | cut -d' ' -f3)
+fi
+
+if [[ $TESTSUITE =~ base|full ]]; then
+    [ -v NFS ] && source "$TESTDIR/nfs.sh"
+    source "$TESTDIR/mixed.sh"
+    # source "$TESTDIR/longhorn.sh"
+    source "$TESTDIR/rancher.sh"
+    # source "$TESTDIR/kube_dashboard.sh"
+    # source "$TESTDIR/nginx-ingress.sh"
+    source "$TESTDIR/reboot.sh"
+    source "$TESTDIR/components.sh" > "$LOGPATH/components.log"
+    [ -v PRESERVE ] || source "$TESTDIR/rke2_uninstall.sh"
+
+elif [ -f $TESTDIR/$TESTSUITE* ]; then
+    source $TESTDIR/$TESTSUITE*
+fi
+
+if [[ $TESTSUITE =~ full ]]; then
+    source "$TESTDIR/sonobuoy.sh"
+fi
+
+exit 0

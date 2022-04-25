@@ -1,3 +1,6 @@
+install-requirements:
+	./scripts/install-requirements
+
 pull-scripts:
 	./scripts/pull-scripts
 
